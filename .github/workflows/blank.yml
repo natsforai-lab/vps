@@ -1,0 +1,99 @@
+name: Secure Tailscale RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # Set a strict runtime limit (e.g., 60 minutes) to stay compliant with GitHub policy
+    timeout-minutes: 60
+
+    steps:
+      - name: Configure Secure RDP Settings
+        run: |
+          # Enable Remote Desktop while KEEPING Network Level Authentication (NLA) active
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+
+          # Configure Firewall to restrict port 3389 to Tailscale interface scope
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale-Inbound" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale-Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Masked Password
+        env:
+          USER_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:USER_PASS) {
+              Write-Error "Secret RDP_PASSWORD is missing! Add it in Repository Settings -> Secrets."
+              exit 1
+          }
+
+          # Mask secret output in logs
+          Write-Host "::add-mask::$env:USER_PASS"
+
+          $securePass = ConvertTo-SecureString$env:USER_PASS -AsPlainText -Force
+          
+          # Create or update user
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile$installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null$retries = 0
+          while (-not $tsIP -and$retries -lt 12) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Failed to acquire Tailscale IP address."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify & Provide Access Info
+        run: |
+          Write-Host "=========================================="
+          Write-Host " Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host " RDP Username : RDP"
+          Write-Host " RDP Password : [Set in Repository Secrets]"
+          Write-Host " NLA Status   : Enabled (Secure)"
+          Write-Host "=========================================="
+
+          # Test connection
+          $test = Test-NetConnection -ComputerName$env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is unreachable on $env:TAILSCALE_IP"
+              exit 1
+          }
+
+      - name: Maintain Active Session (Bounded Duration)
+        run: |
+          # Keep session running up to 55 minutes max to avoid runner abuse detection
+          $timeoutMinutes = 55$startTime = Get-Date
+          while (((Get-Date) - $startTime).TotalMinutes -lt$timeoutMinutes) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active. Remaining: $([math]::Round($timeoutMinutes - ((Get-Date) -$startTime).TotalMinutes)) mins"
+              Start-Sleep -Seconds 300
+          }
